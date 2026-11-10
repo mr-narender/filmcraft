@@ -85,6 +85,17 @@ fn main() -> eframe::Result {
     if let Some(result) = craft_update::self_update::finish(&filmcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
         std::process::exit(i32::from(result.is_err()));
     }
+    // Windows: the graphics test start (graphics/probe.rs) is this program started with
+    // `--test-graphics-start <mode>`. It creates the device the window would, then exits.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let test_setup = |mode| {
+        let mut options = native_options(false);
+        graphics::apply(&mut options, mode, eframe::wgpu::Backends::from_env());
+        options.wgpu_options.wgpu_setup
+    };
+    if let Some(code) = graphics::probe::child_main(&args, test_setup) {
+        std::process::exit(code);
+    }
     // First, so the panic hook and every start-up record are logged (`logging`).
     let logger = logging::install();
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
@@ -109,9 +120,13 @@ fn main() -> eframe::Result {
     log::info!("FilmCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     // The log file lives next to the crash logs; opened after the arguments, so `--help`,
     // `--version` and usage errors leave no file behind. Records logged until now go in first.
+    let mut log_file = None;
     if let Some(logger) = logger {
         match log_dir.as_deref().map(|d| logger.attach_dir(d)) {
-            Some(Ok(path)) => log::info!("log file {}", path.display()),
+            Some(Ok(path)) => {
+                log::info!("log file {}", path.display());
+                log_file = Some(path);
+            }
             Some(Err(e)) => log::warn!("no log file: {e}"),
             None => {
                 logger.stderr_only();
@@ -133,6 +148,16 @@ fn main() -> eframe::Result {
     // see graphics.rs.
     let backend_override = eframe::wgpu::Backends::from_env();
     let mut graphics = graphics::GraphicsStart::begin(data_root.as_deref(), backend_override.is_some(), launch.graphics);
+    // Windows: test the mode in a child process first when anything changed since the last start
+    // that worked, so a driver that hangs moves on to the next mode, or ends in a message saying
+    // what each mode did, instead of a FilmCraft that runs with no window (#1061, #2634).
+    if let Err(msg) = graphics::probe::choose(&mut graphics, launch.graphics.is_some(), backend_override.is_some(), log_file.as_deref()) {
+        log::error!("{msg}");
+        filmcraft_ui_egui::crash::record(&msg);
+        graphics.abandon();
+        let _ = rfd::MessageDialog::new().set_title("FilmCraft").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
+        std::process::exit(1);
+    }
     // The GPU export renderer creates its own wgpu instance with every backend; after a start
     // fell back, that would load the driver that failed. Exports then composite on the CPU.
     if graphics.mode() == graphics::Mode::Default {
@@ -148,7 +173,7 @@ fn main() -> eframe::Result {
         match &result {
             // wgpu reported the failure (no adapter, device creation failed) before the app
             // existed: try the next mode in this process.
-            Err(e) if !app_created && graphics::is_graphics_failure(e) && graphics.step_down() => {
+            Err(e) if !app_created && graphics::is_graphics_failure(e) && graphics.step_down(&e.to_string()) => {
                 log::warn!("graphics start failed: {e}");
                 continue;
             }
@@ -172,7 +197,7 @@ fn main() -> eframe::Result {
             log::error!("{inner}");
             std::process::exit(1);
         }
-        let msg = format!("FilmCraft could not start its window: {e}\n\nUpdating the graphics driver usually fixes this.");
+        let msg = graphics::failure_message(&e.to_string(), graphics.failed(), log_file.as_deref());
         log::error!("{msg}");
         filmcraft_ui_egui::crash::record(&msg);
         let _ = rfd::MessageDialog::new().set_title("FilmCraft").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
